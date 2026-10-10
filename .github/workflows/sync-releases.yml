@@ -1,9 +1,11 @@
-name: Sync upstream PeerTube releases
+name: Sync upstream PeerTube (repo + releases)
 
-# 自动把上游 chocobozzz/PeerTube 的【新】Release 同步到本 fork。
-# - 每 6 小时触发一次（cron），也可在 Actions 页面手动 Run workflow。
+# 把上游 chocobozzz/PeerTube 的【仓库分支 + tag】和【新 Release】一起同步到本 fork。
+# - 每 6 小时自动跑（cron），也可在 Actions 页面手动 Run workflow。
 # - 用仓库自带 GITHUB_TOKEN 写入，无需任何外部 Token。
-# - 只同步“比本 fork 现有最新 Release 更新”的版本，不会回灌历史。
+# - 仓库：强制把上游各分支 / tag 镜像到 fork（develop 在镜像后会自动补回本工作流文件，保证自动同步可持续）。
+# - Release：只同步“比本 fork 现有最新 Release 更新”的版本，不回灌历史。
+# 注意：仓库镜像为 force-push，会把 fork 的分支覆盖为上游版本；若 fork 上有自己的提交会被覆盖。
 on:
   schedule:
     - cron: '17 */6 * * *'
@@ -16,6 +18,39 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          ref: develop
+
+      - name: Sync branches, tags, and restore workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git remote add upstream https://github.com/chocobozzz/PeerTube.git || git remote set-url upstream https://github.com/chocobozzz/PeerTube.git
+          git fetch upstream --prune --tags
+          # 强制镜像上游所有【非默认】分支到 fork（fork 上独有的分支不受影响）
+          for b in $(git branch -r --list 'upstream/*' | sed 's#^ *upstream/##' | grep -v '^HEAD$'); do
+            if [ "$b" != "develop" ]; then
+              echo "::sync branch $b"
+              git push origin --force "upstream/$b:refs/heads/$b"
+            fi
+          done
+          # 镜像 tag
+          git push origin --force --tags
+          # 把 develop 重置为上游 develop，再补回本工作流文件（取自本 fork 上一次 develop 提交，避免被上游镜像冲掉）
+          OLD=$(git rev-parse develop)
+          git checkout -B develop upstream/develop
+          git checkout "$OLD" -- .github/workflows/sync-releases.yml
+          git add .github/workflows/sync-releases.yml
+          git commit -m "ci: restore auto-sync workflow after upstream mirror" || echo "workflow already present, skip commit"
+          git push origin develop --force
+
       - name: Sync new upstream releases into this fork
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
