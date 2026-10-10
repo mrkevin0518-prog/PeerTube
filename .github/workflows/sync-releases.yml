@@ -1,0 +1,123 @@
+name: Sync upstream PeerTube releases
+
+# 自动把上游 chocobozzz/PeerTube 的【新】Release 同步到本 fork。
+# - 每 6 小时触发一次（cron），也可在 Actions 页面手动 Run workflow。
+# - 用仓库自带 GITHUB_TOKEN 写入，无需任何外部 Token。
+# - 只同步“比本 fork 现有最新 Release 更新”的版本，不会回灌历史。
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync new upstream releases into this fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: chocobozzz/PeerTube
+          FORK: ${{ github.repository }}
+        run: |
+          cat > sync_releases.py <<'PYEOF'
+          import json, os, sys, time, urllib.parse, urllib.request, urllib.error
+
+          API = "https://api.github.com"
+          UA = {"User-Agent": "gha-release-sync", "Accept": "application/vnd.github+json"}
+
+          def api(token, method, path, data=None):
+              url = API + path
+              for attempt in range(5):
+                  h = dict(UA)
+                  if token:
+                      h["Authorization"] = "Bearer " + token
+                  if data is not None:
+                      body = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  else:
+                      body = None
+                  req = urllib.request.Request(url, data=body, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          raw = r.read()
+                          ct = r.headers.get("Content-Type", "")
+                          return json.loads(raw) if ("application/json" in ct and raw) else None
+                  except urllib.error.HTTPError as e:
+                      err = e.read().decode("utf-8", "replace")
+                      if e.code in (429, 500, 502, 503) and attempt < 4:
+                          time.sleep(int(e.headers.get("Retry-After", "2")) * (attempt + 1))
+                          continue
+                      print("HTTP %d %s %s\n%s" % (e.code, method, path, err[:600]), file=sys.stderr)
+                      raise
+                  except Exception:
+                      if attempt < 4:
+                          time.sleep(2 * (attempt + 1))
+                          continue
+                      raise
+
+          def release_exists(token, fork, tag):
+              try:
+                  api(token, "GET", "/repos/%s/releases/tags/%s" % (fork, urllib.parse.quote(tag, safe="")))
+                  return True
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return False
+                  raise
+
+          def sha_for(token, upstream, tag):
+              return api(token, "GET", "/repos/%s/commits/%s" % (upstream, urllib.parse.quote(tag, safe="")))["sha"]
+
+          def tag_exists(token, fork, tag):
+              try:
+                  api(token, "GET", "/repos/%s/git/refs/tags/%s" % (fork, urllib.parse.quote(tag, safe="")))
+                  return True
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return False
+                  raise
+
+          def ensure_tag(token, fork, tag, sha):
+              if tag_exists(token, fork, tag):
+                  return False
+              api(token, "POST", "/repos/%s/git/refs" % fork, {"ref": "refs/tags/%s" % tag, "sha": sha})
+              return True
+
+          def create_release(token, fork, rel, sha):
+              return api(token, "POST", "/repos/%s/releases" % fork, {
+                  "tag_name": rel["tag_name"],
+                  "name": rel.get("name") or rel["tag_name"],
+                  "body": rel.get("body") or "",
+                  "prerelease": bool(rel.get("prerelease")),
+                  "draft": False,
+                  "target_commitish": sha,
+              })
+
+          def main():
+              tok = os.environ["GH_TOKEN"]
+              upstream = os.environ.get("UPSTREAM", "chocobozzz/PeerTube")
+              fork = os.environ["FORK"]
+              rels = api(tok, "GET", "/repos/%s/releases?per_page=100" % upstream)
+              rels = [r for r in rels if not r.get("draft")]
+              print("Upstream newest-first: %d releases considered" % len(rels))
+              created = 0
+              for rel in rels:
+                  tag = rel["tag_name"]
+                  if release_exists(token, fork, tag):
+                      # 第一个已存在于 fork 的版本 -> 其之后的都更旧、已同步过，停止
+                      print("[stop] %s already on fork; nothing newer pending" % tag)
+                      break
+                  sha = sha_for(tok, upstream, tag)
+                  ensure_tag(tok, fork, tag, sha)
+                  new = create_release(tok, fork, rel, sha)
+                  print("[ok]   %s -> %s" % (tag, new.get("html_url")))
+                  created += 1
+                  time.sleep(0.4)
+              print("Done. created=%d" % created)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 sync_releases.py
