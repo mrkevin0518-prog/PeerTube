@@ -1,0 +1,457 @@
+name: Sync upstream PeerTube (repo + releases)
+
+# 把上游 chocobozzz/PeerTube 的【仓库分支 + tag】和【新 Release】一起同步到本 fork。
+# - 每 6 小时自动跑（cron），也可在 Actions 页面手动 Run workflow。
+# - 用仓库自带 GITHUB_TOKEN 写入，无需任何外部 Token。
+# - 仓库：强制把上游各分支 / tag 镜像到 fork（develop 在镜像后会自动补回本工作流文件，保证自动同步可持续）。
+# - Release：只同步“比本 fork 现有最新 Release 更新”的版本，不回灌历史。
+# - 保留策略：Release 只保留最新 KEEP_N 个，更旧的每次同步后自动删除（tag 不删，历史版本仍可 checkout）。
+# - 前台展示：把“当前版本”徽章写进 README（首页可见），并尝试刷新仓库 About 描述。
+# 注意：仓库镜像为 force-push，会把 fork 的分支覆盖为上游版本；若 fork 上有自己的提交会被覆盖。
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  KEEP_N: '2'
+  UPSTREAM_REPO: chocobozzz/PeerTube
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          ref: develop
+
+      - name: Sync branches, tags, and restore workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions-bot@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git remote add upstream https://github.com/chocobozzz/PeerTube.git || git remote set-url upstream https://github.com/chocobozzz/PeerTube.git
+          git fetch upstream --prune --tags
+
+          # 1) 最关键：先把 develop 重置为上游 develop，再补回本工作流文件（取自上一次 develop 提交），并 force-push。
+          #    顺序放在最前，保证即使后续分支/tag 推送出问题，自动同步自身也不会失效。
+          OLD=$(git rev-parse develop)
+          git checkout -B develop upstream/develop
+          git checkout "$OLD" -- .github/workflows/sync-releases.yml
+          git add .github/workflows/sync-releases.yml
+          git commit -m "ci: restore auto-sync workflow after upstream mirror" || echo "workflow already present, skip commit"
+          git push origin develop --force
+
+          # 2) 强制镜像上游所有【非默认】分支到 fork（fork 独有的分支不受影响）；失败不致命，仅告警。
+          #    注意：需排除 upstream/develop 与 remote HEAD 软链接，否则会产生空 refspec 的无效推送。
+          for b in $(git branch -r --list 'upstream/*' | sed 's#^ *upstream/##' | grep -v '^HEAD$' | grep -v '^upstream/' | grep -v '^$'); do
+            if [ "$b" != "develop" ]; then
+              echo "::sync branch $b"
+              git push origin --force "upstream/$b:refs/heads/$b" || echo "::warning::branch $b push failed (non-fatal)"
+            fi
+          done
+
+          # 3) 强制镜像所有 tag。用显式 '+' 强制 refspec，覆盖 fork 上已有的轻量 tag 为上游附注 tag；失败不致命。
+          git push origin "+refs/tags/*:refs/tags/*" || echo "::warning::tag push failed (non-fatal)"
+
+      - name: Sync new upstream releases into this fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: ${{ env.UPSTREAM_REPO }}
+          FORK: ${{ github.repository }}
+        run: |
+          cat > sync_releases.py <<'PYEOF'
+          import json, os, sys, time, urllib.parse, urllib.request, urllib.error
+
+          API = "https://api.github.com"
+          UA = {"User-Agent": "gha-release-sync", "Accept": "application/vnd.github+json"}
+
+          def api(tok, method, path, data=None):
+              url = API + path
+              for attempt in range(5):
+                  h = dict(UA)
+                  if tok:
+                      h["Authorization"] = "Bearer " + tok
+                  if data is not None:
+                      body = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  else:
+                      body = None
+                  req = urllib.request.Request(url, data=body, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          raw = r.read()
+                          ct = r.headers.get("Content-Type", "")
+                          return json.loads(raw) if ("application/json" in ct and raw) else None
+                  except urllib.error.HTTPError as e:
+                      err = e.read().decode("utf-8", "replace")
+                      if e.code in (429, 500, 502, 503) and attempt < 4:
+                          time.sleep(int(e.headers.get("Retry-After", "2")) * (attempt + 1))
+                          continue
+                      print("HTTP %d %s %s\n%s" % (e.code, method, path, err[:600]), file=sys.stderr)
+                      raise
+                  except Exception:
+                      if attempt < 4:
+                          time.sleep(2 * (attempt + 1))
+                          continue
+                      raise
+
+          def release_exists(tok, fork, tag):
+              try:
+                  api(tok, "GET", "/repos/%s/releases/tags/%s" % (fork, urllib.parse.quote(tag, safe="")))
+                  return True
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return False
+                  raise
+
+          def sha_for(tok, upstream, tag):
+              return api(tok, "GET", "/repos/%s/commits/%s" % (upstream, urllib.parse.quote(tag, safe="")))["sha"]
+
+          def tag_exists(tok, fork, tag):
+              try:
+                  api(tok, "GET", "/repos/%s/git/refs/tags/%s" % (fork, urllib.parse.quote(tag, safe="")))
+                  return True
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return False
+                  raise
+
+          def ensure_tag(tok, fork, tag, sha):
+              if tag_exists(tok, fork, tag):
+                  return False
+              api(tok, "POST", "/repos/%s/git/refs" % fork, {"ref": "refs/tags/%s" % tag, "sha": sha})
+              return True
+
+          def create_release(tok, fork, rel, sha):
+              return api(tok, "POST", "/repos/%s/releases" % fork, {
+                  "tag_name": rel["tag_name"],
+                  "name": rel.get("name") or rel["tag_name"],
+                  "body": rel.get("body") or "",
+                  "prerelease": bool(rel.get("prerelease")),
+                  "draft": False,
+                  "target_commitish": sha,
+              })
+
+          def main():
+              tok = os.environ["GH_TOKEN"]
+              upstream = os.environ.get("UPSTREAM", "chocobozzz/PeerTube")
+              fork = os.environ["FORK"]
+              rels = api(tok, "GET", "/repos/%s/releases?per_page=100" % upstream)
+              rels = [r for r in rels if not r.get("draft")]
+              print("Upstream newest-first: %d releases considered" % len(rels))
+              created = 0
+              for rel in rels:
+                  tag = rel["tag_name"]
+                  if release_exists(tok, fork, tag):
+                      # 第一个已存在于 fork 的版本 -> 其之后的都更旧、已同步过，停止
+                      print("[stop] %s already on fork; nothing newer pending" % tag)
+                      break
+                  sha = sha_for(tok, upstream, tag)
+                  ensure_tag(tok, fork, tag, sha)
+                  new = create_release(tok, fork, rel, sha)
+                  print("[ok]   %s -> %s" % (tag, new.get("html_url")))
+                  created += 1
+                  time.sleep(0.4)
+              print("Done. created=%d" % created)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 sync_releases.py
+
+      - name: Re-sync release notes and assets for kept releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: ${{ env.UPSTREAM_REPO }}
+          FORK: ${{ github.repository }}
+          KEEP_N: ${{ env.KEEP_N }}
+        run: |
+          cat > resync_releases.py <<'PYEOF'
+          # 上游常在发布后【修改 Release 描述】（PeerTube v8.3.1 先发占位说明，一周后才补安全公告），
+          # 且建 Release 不会带走附件。本步骤对保留的每个 Release 校正描述并补齐附件；
+          # 已存在且大小一致的附件会跳过，所以稳态下不会重复上传。
+          import http.client, json, os, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
+
+          API = "https://api.github.com"
+          UA = {"User-Agent": "gha-release-resync", "Accept": "application/vnd.github+json"}
+
+          def api(tok, method, path, data=None):
+              url = API + path
+              for attempt in range(5):
+                  h = dict(UA)
+                  h["Authorization"] = "Bearer " + tok
+                  body = None
+                  if data is not None:
+                      body = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  req = urllib.request.Request(url, data=body, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          raw = r.read()
+                          ct = r.headers.get("Content-Type", "")
+                          return json.loads(raw) if ("application/json" in ct and raw) else None
+                  except urllib.error.HTTPError as e:
+                      err = e.read().decode("utf-8", "replace")
+                      if e.code in (429, 500, 502, 503) and attempt < 4:
+                          time.sleep(int(e.headers.get("Retry-After", "2")) * (attempt + 1))
+                          continue
+                      print("HTTP %d %s %s\n%s" % (e.code, method, path, err[:600]), file=sys.stderr)
+                      raise
+                  except Exception:
+                      if attempt < 4:
+                          time.sleep(2 * (attempt + 1))
+                          continue
+                      raise
+
+          def semver_key(tag):
+              raw = (tag or "").strip()
+              core, _, pre = raw.lstrip("vV").partition("-")
+              nums = []
+              for part in core.split(".")[:3]:
+                  nums.append(int(part) if part.isdigit() else 0)
+              while len(nums) < 3:
+                  nums.append(0)
+              pre_ids = []
+              for ident in pre.split(".") if pre else []:
+                  pre_ids.append((0, int(ident), "") if ident.isdigit() else (1, 0, ident))
+              return (nums[0], nums[1], nums[2], 1 if not pre_ids else 0, pre_ids, raw)
+
+          def download(url, dest):
+              req = urllib.request.Request(url, headers={"User-Agent": UA["User-Agent"]})
+              with urllib.request.urlopen(req, timeout=900) as r, open(dest, "wb") as f:
+                  while True:
+                      chunk = r.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      f.write(chunk)
+
+          def upload(tok, upload_url_template, path, name, content_type):
+              # 流式上传并显式给 Content-Length（GitHub 附件上传不接受 chunked 编码）
+              base = upload_url_template.split("{")[0]
+              size = os.path.getsize(path)
+              qpath = base.split("uploads.github.com", 1)[-1] + "?name=" + urllib.parse.quote(name)
+              conn = http.client.HTTPSConnection("uploads.github.com", timeout=1800)
+              try:
+                  with open(path, "rb") as fh:
+                      conn.request("POST", qpath, body=fh, headers={
+                          "Authorization": "Bearer " + tok,
+                          "Content-Type": content_type,
+                          "Content-Length": str(size),
+                          "User-Agent": UA["User-Agent"],
+                          "Accept": "application/vnd.github+json",
+                      })
+                  resp = conn.getresponse()
+                  raw = resp.read()
+                  if resp.status not in (200, 201):
+                      raise RuntimeError("upload HTTP %d: %s" % (resp.status, raw[:300].decode("utf-8", "replace")))
+              finally:
+                  conn.close()
+
+          def main():
+              tok = os.environ["GH_TOKEN"]
+              upstream = os.environ.get("UPSTREAM", "chocobozzz/PeerTube")
+              fork = os.environ["FORK"]
+              keep_n = int(os.environ.get("KEEP_N", "2"))
+              rels = [r for r in api(tok, "GET", "/repos/%s/releases?per_page=100" % fork)
+                      if not r.get("draft")]
+              rels.sort(key=lambda r: semver_key(r["tag_name"]), reverse=True)
+              for fk in rels[:keep_n]:
+                  tag = fk["tag_name"]
+                  try:
+                      up = api(tok, "GET", "/repos/%s/releases/tags/%s" % (upstream, urllib.parse.quote(tag, safe="")))
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404:
+                          print("[skip] %s not found upstream" % tag)
+                          continue
+                      raise
+
+                  patch = {}
+                  if (up.get("name") or "") != (fk.get("name") or ""):
+                      patch["name"] = up.get("name") or tag
+                  if (up.get("body") or "") != (fk.get("body") or ""):
+                      patch["body"] = up.get("body") or ""
+                  if bool(up.get("prerelease")) != bool(fk.get("prerelease")):
+                      patch["prerelease"] = bool(up.get("prerelease"))
+                  if patch:
+                      api(tok, "PATCH", "/repos/%s/releases/%d" % (fork, fk["id"]), patch)
+                      print("[notes] %s updated (%s)" % (tag, ", ".join(sorted(patch))))
+                  else:
+                      print("[notes] %s already current" % tag)
+
+                  have = {a["name"]: a for a in (fk.get("assets") or [])}
+                  for ua in (up.get("assets") or []):
+                      name = ua["name"]
+                      cur = have.get(name)
+                      if cur and cur.get("size") == ua.get("size"):
+                          print("[asset] %-30s OK" % name)
+                          continue
+                      if cur:
+                          api(tok, "DELETE", "/repos/%s/releases/assets/%d" % (fork, cur["id"]))
+                          print("[asset] %-30s stale, replaced" % name)
+                      fd, path = tempfile.mkstemp(prefix="relasset-", dir=".")
+                      os.close(fd)
+                      try:
+                          print("[asset] %-30s downloading %d bytes ..." % (name, ua["size"]), flush=True)
+                          download(ua["browser_download_url"], path)
+                          if os.path.getsize(path) != ua["size"]:
+                              raise RuntimeError("size mismatch for %s" % name)
+                          print("[asset] %-30s uploading ..." % name, flush=True)
+                          upload(tok, fk["upload_url"], path, name,
+                                 ua.get("content_type") or "application/octet-stream")
+                          print("[asset] %-30s done" % name, flush=True)
+                      finally:
+                          if os.path.exists(path):
+                              os.remove(path)
+                  # fork 上多余（上游已无）的附件删掉，保持完全一致
+                  want = {a["name"] for a in (up.get("assets") or [])}
+                  for name, fa in have.items():
+                      if name not in want:
+                          try:
+                              api(tok, "DELETE", "/repos/%s/releases/assets/%d" % (fork, fa["id"]))
+                              print("[asset] %-30s removed (no longer upstream)" % name)
+                          except Exception as e:
+                              print("::warning::remove %s failed: %s" % (name, e))
+              print("resync done")
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 resync_releases.py
+
+      - name: Prune old releases and refresh version badge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORK: ${{ github.repository }}
+          KEEP_N: ${{ env.KEEP_N }}
+        run: |
+          cat > apply_policy.py <<'PYEOF'
+          import base64, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+
+          API = "https://api.github.com"
+          UA = {"User-Agent": "gha-release-policy", "Accept": "application/vnd.github+json"}
+          START = "<!-- PEERTUBE-SYNC-BADGE-START -->"
+          END = "<!-- PEERTUBE-SYNC-BADGE-END -->"
+
+          def api(tok, method, path, data=None):
+              url = API + path
+              for attempt in range(5):
+                  h = dict(UA)
+                  h["Authorization"] = "Bearer " + tok
+                  body = None
+                  if data is not None:
+                      body = json.dumps(data).encode()
+                      h["Content-Type"] = "application/json"
+                  req = urllib.request.Request(url, data=body, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          raw = r.read()
+                          ct = r.headers.get("Content-Type", "")
+                          return json.loads(raw) if ("application/json" in ct and raw) else None
+                  except urllib.error.HTTPError as e:
+                      err = e.read().decode("utf-8", "replace")
+                      if e.code in (429, 500, 502, 503) and attempt < 4:
+                          time.sleep(int(e.headers.get("Retry-After", "2")) * (attempt + 1))
+                          continue
+                      print("HTTP %d %s %s\n%s" % (e.code, method, path, err[:600]), file=sys.stderr)
+                      raise
+                  except Exception:
+                      if attempt < 4:
+                          time.sleep(2 * (attempt + 1))
+                          continue
+                      raise
+
+          def semver_key(tag):
+              # 按版本号排序，不能用 published_at：批量创建的 Release 时间戳几乎相同。
+              # v8.3.1 > v8.3.0 > v8.3.0-rc.1；正式版优先于同版本预发布版。
+              raw = (tag or "").strip()
+              core, _, pre = raw.lstrip("vV").partition("-")
+              nums = []
+              for part in core.split(".")[:3]:
+                  nums.append(int(part) if part.isdigit() else 0)
+              while len(nums) < 3:
+                  nums.append(0)
+              pre_ids = []
+              for ident in pre.split(".") if pre else []:
+                  if ident.isdigit():
+                      pre_ids.append((0, int(ident), ""))
+                  else:
+                      pre_ids.append((1, 0, ident))
+              return (nums[0], nums[1], nums[2], 1 if not pre_ids else 0, pre_ids, raw)
+
+          def badge_block(repo, version):
+              return (
+                  "%s\n"
+                  "> \U0001f504 **\u6bcf 6 \u5c0f\u65f6\u81ea\u52a8\u540c\u6b65\u81ea "
+                  "[chocobozzz/PeerTube](https://github.com/chocobozzz/PeerTube)**"
+                  " \u00b7 \u5f53\u524d\u7248\u672c\uff1a"
+                  "[`%s`](https://github.com/%s/releases/latest)\n"
+                  "%s" % (START, version, repo, END)
+              )
+
+          def main():
+              tok = os.environ["GH_TOKEN"]
+              fork = os.environ["FORK"]
+              keep_n = int(os.environ.get("KEEP_N", "2"))
+              branch = api(tok, "GET", "/repos/%s" % fork)["default_branch"]
+
+              rels = [r for r in api(tok, "GET", "/repos/%s/releases?per_page=100" % fork)
+                      if not r.get("draft")]
+              rels.sort(key=lambda r: semver_key(r["tag_name"]), reverse=True)
+              keep, drop = rels[:keep_n], rels[keep_n:]
+              latest = keep[0]["tag_name"] if keep else "n/a"
+              print("Fork releases: %d | keep newest %d: %s"
+                    % (len(rels), keep_n, ", ".join(r["tag_name"] for r in keep)))
+              print("Delete older: %s" % (", ".join(r["tag_name"] for r in drop) or "(none)"))
+
+              for r in drop:
+                  try:
+                      api(tok, "DELETE", "/repos/%s/releases/%d" % (fork, r["id"]))
+                      print("[del] %s" % r["tag_name"])
+                      time.sleep(0.3)
+                  except Exception as e:
+                      print("::warning::delete %s failed: %s" % (r["tag_name"], e))
+
+              # README 徽章：首页可见的“当前版本”。镜像 develop 后会被上游 README 覆盖，所以每次都重写。
+              try:
+                  info = api(tok, "GET", "/repos/%s/readme?ref=%s" % (fork, urllib.parse.quote(branch, safe="")))
+                  text = base64.b64decode(info["content"]).decode("utf-8", "replace")
+                  block = badge_block(fork, latest)
+                  if START in text and END in text:
+                      new_text = re.sub(re.escape(START) + r".*?" + re.escape(END), lambda _m: block, text, flags=re.S)
+                  else:
+                      new_text = block + "\n" + text
+                  if new_text != text:
+                      api(tok, "PUT", "/repos/%s/contents/README.md" % fork, {
+                          "message": "docs: show synced version %s in README" % latest,
+                          "content": base64.b64encode(new_text.encode("utf-8")).decode(),
+                          "branch": branch,
+                          "sha": info["sha"],
+                      })
+                      print("[ok] README badge -> %s" % latest)
+                  else:
+                      print("[ok] README badge already current (%s)" % latest)
+              except Exception as e:
+                  print("::warning::README badge update failed: %s" % e)
+
+              # 仓库 About 描述（GITHUB_TOKEN 通常无权限改 repo 设置，失败不影响其它步骤）
+              try:
+                  desc = ("\U0001f504 PeerTube \u955c\u50cf\u540c\u6b65\uff08\u81ea chocobozzz/PeerTube\uff09"
+                          " \u00b7 \u5f53\u524d\u7248\u672c %s" % latest)
+                  api(tok, "PATCH", "/repos/%s" % fork, {"description": desc})
+                  print("[ok] About description -> %s" % desc)
+              except Exception as e:
+                  print("::warning::About description not updated (needs admin token): %s" % e)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 apply_policy.py
