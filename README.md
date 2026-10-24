@@ -1,3 +1,6 @@
+<!-- PEERTUBE-SYNC-BADGE-START -->
+> 🔄 **每 6 小时自动同步自 [chocobozzz/PeerTube](https://github.com/chocobozzz/PeerTube)** · 当前版本：[`v8.3.1`](https://github.com/mrkevin0518-prog/PeerTube/releases/latest)
+<!-- PEERTUBE-SYNC-BADGE-END -->
 <h1 align="center">
   <a href="https://joinpeertube.org">
     <img src="https://joinpeertube.org/img/brand.png" alt="PeerTube">
